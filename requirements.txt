@@ -2,3 +2,4 @@ playwright
 pandas
 supabase
 python-2captcha
+twocaptcha
