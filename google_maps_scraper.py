@@ -2,45 +2,49 @@ import asyncio
 import logging
 import os
 import random
+import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from supabase import create_client, Client
 from urllib.parse import quote
-from twocaptcha import TwoCaptcha
-from twocaptcha.api import ApiException
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Environment variables
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY")
+# Your Supabase credentials
+SUPABASE_URL = "https://gbrcgpzdemwtntaafopx.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdicmNncHpkZW13dG50YWFmb3B4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkxMTE1NTksImV4cCI6MjA2NDY4NzU1OX0.AwQYMoKJMNQ3Y6guSsiq9Ur48pNUJOkxujiK8xzuH4A"
+TWOCAPTCHA_API_KEY = "b181f81777daef3a34f0f2a4786f0356"
+
+# Optional proxy settings (set these in Railway if needed)
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
 
-# Validate required environment variables
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.error("SUPABASE_URL and SUPABASE_KEY are required")
-    exit(1)
-
 # Initialize Supabase client
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("Supabase client initialized successfully")
+    logger.info("✅ Supabase client initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize Supabase client: {e}")
+    logger.error(f"❌ Failed to initialize Supabase client: {e}")
     exit(1)
 
 # Initialize 2Captcha client
-twocaptcha = TwoCaptcha(TWOCAPTCHA_API_KEY) if TWOCAPTCHA_API_KEY else None
-if twocaptcha:
-    logger.info("2Captcha client initialized")
-else:
-    logger.warning("2Captcha API key not provided - CAPTCHA solving disabled")
+twocaptcha = None
+try:
+    from twocaptcha import TwoCaptcha
+    from twocaptcha.api import ApiException
+    twocaptcha = TwoCaptcha(TWOCAPTCHA_API_KEY)
+    logger.info("✅ 2Captcha client initialized successfully")
+except ImportError as e:
+    logger.error(f"❌ Failed to import 2captcha: {e}")
+    logger.error("Make sure 2captcha-python is installed: pip install 2captcha-python")
+    exit(1)
+except Exception as e:
+    logger.error(f"❌ Failed to initialize 2Captcha: {e}")
+    exit(1)
 
-# Queries
+# Search queries for furniture stores
 QUERIES = [
     {"query": "furniture store in 93307"},
     {"query": "furniture store in 92503"},
@@ -58,59 +62,107 @@ PROXY = {
 
 async def solve_captcha(page):
     """Attempt to solve CAPTCHA using 2Captcha service"""
-    if not twocaptcha:
-        logger.error("2Captcha API key not provided")
-        return False
-    
     try:
-        logger.info("Attempting to solve CAPTCHA")
+        logger.info("🔍 Checking for CAPTCHA...")
         
-        # Detect CAPTCHA (e.g., reCAPTCHA checkbox)
-        captcha = await page.query_selector('div[aria-label*="CAPTCHA"]') or \
-                 await page.query_selector('iframe[src*="recaptcha"]')
+        # Wait a bit for any CAPTCHA to load
+        await asyncio.sleep(3)
         
-        if not captcha:
-            logger.info("No CAPTCHA detected")
+        # Look for different types of CAPTCHA elements
+        captcha_selectors = [
+            'iframe[src*="recaptcha"]',
+            'div[class*="recaptcha"]',
+            '[id*="captcha"]',
+            '[class*="captcha"]'
+        ]
+        
+        captcha_element = None
+        for selector in captcha_selectors:
+            captcha_element = await page.query_selector(selector)
+            if captcha_element:
+                logger.info(f"🎯 Found CAPTCHA with selector: {selector}")
+                break
+        
+        if not captcha_element:
+            logger.info("✅ No CAPTCHA detected")
             return True
         
-        # Get sitekey from reCAPTCHA iframe
+        # Get the site key for reCAPTCHA
         sitekey = await page.evaluate('''() => {
+            // Try multiple ways to find the sitekey
             const iframe = document.querySelector('iframe[src*="recaptcha"]');
-            return iframe ? iframe.src.match(/k=([^&]+)/)?.[1] : null;
+            if (iframe && iframe.src) {
+                const match = iframe.src.match(/k=([A-Za-z0-9_-]+)/);
+                if (match) return match[1];
+            }
+            
+            // Look for data-sitekey attribute
+            const elements = document.querySelectorAll('[data-sitekey]');
+            for (let el of elements) {
+                if (el.getAttribute('data-sitekey')) {
+                    return el.getAttribute('data-sitekey');
+                }
+            }
+            
+            return null;
         }''')
         
         if not sitekey:
-            logger.error("Could not find CAPTCHA sitekey")
+            logger.error("❌ Could not find CAPTCHA sitekey")
             return False
         
+        logger.info(f"🔑 Found sitekey: {sitekey[:20]}...")
+        
         # Solve CAPTCHA with 2Captcha
+        logger.info("🤖 Solving CAPTCHA with 2Captcha...")
         result = twocaptcha.recaptcha(
             sitekey=sitekey,
-            url=page.url,
-            proxy=PROXY if PROXY.get("server") else None
+            url=page.url
         )
-        code = result['code']
-        logger.info("CAPTCHA solved successfully")
         
-        # Inject CAPTCHA response
-        await page.evaluate(f'''() => {{
-            const responseEl = document.getElementById('g-recaptcha-response');
-            if (responseEl) {{
-                responseEl.innerHTML = "{code}";
-                if (typeof grecaptcha !== 'undefined') {{
-                    grecaptcha.execute();
+        captcha_solution = result['code']
+        logger.info("✅ CAPTCHA solved successfully!")
+        
+        # Inject the solution
+        await page.evaluate(f'''
+            (function() {{
+                // Find and fill the response textarea
+                const responseArea = document.getElementById('g-recaptcha-response') || 
+                                   document.querySelector('[name="g-recaptcha-response"]');
+                if (responseArea) {{
+                    responseArea.style.display = 'block';
+                    responseArea.value = "{captcha_solution}";
+                    responseArea.innerHTML = "{captcha_solution}";
                 }}
-            }}
-        }}''')
+                
+                // Trigger the callback if available
+                if (typeof grecaptcha !== 'undefined' && grecaptcha.getResponse) {{
+                    try {{
+                        grecaptcha.execute();
+                    }} catch(e) {{
+                        console.log('grecaptcha.execute failed:', e);
+                    }}
+                }}
+                
+                // Submit any forms that might be waiting
+                const forms = document.querySelectorAll('form');
+                forms.forEach(form => {{
+                    const submitBtn = form.querySelector('[type="submit"]');
+                    if (submitBtn) {{
+                        submitBtn.click();
+                    }}
+                }});
+            }})();
+        ''')
         
-        await asyncio.sleep(2)  # Wait for submission
+        await asyncio.sleep(3)  # Wait for submission
         return True
         
     except ApiException as e:
-        logger.error(f"2Captcha error: {e}")
+        logger.error(f"❌ 2Captcha API error: {e}")
         return False
     except Exception as e:
-        logger.error(f"Error solving CAPTCHA: {e}")
+        logger.error(f"❌ Error solving CAPTCHA: {e}")
         return False
 
 async def scrape_google_maps(query, page):
@@ -118,167 +170,174 @@ async def scrape_google_maps(query, page):
     results = []
     
     try:
-        logger.info(f"Processing query: {query}")
+        logger.info(f"🔍 Processing query: {query}")
         
-        # Encode query for URL
+        # Navigate to Google Maps search
         encoded_query = quote(query)
         url = f"https://www.google.com/maps/search/{encoded_query}/"
         
-        # Navigate to Google Maps
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-        except PlaywrightTimeoutError:
-            logger.warning(f"Timeout navigating to {url}, retrying after CAPTCHA check")
-            if await solve_captcha(page):
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-            else:
-                logger.error(f"Failed to solve CAPTCHA for {query}")
-                return results
-        
-        logger.info(f"Loaded Google Maps for query: {query}")
+        logger.info(f"🌐 Navigating to: {url}")
+        await page.goto(url, wait_until="networkidle", timeout=30000)
         
         # Check for CAPTCHA
-        if await page.query_selector('div[aria-label*="CAPTCHA"]') or \
-           await page.query_selector('iframe[src*="recaptcha"]'):
-            logger.info("CAPTCHA detected, attempting to solve")
-            if not await solve_captcha(page):
-                logger.error(f"Failed to solve CAPTCHA for {query}")
-                return results
+        await solve_captcha(page)
         
-        # Wait for search results
+        # Wait for search results to load
         try:
-            await page.wait_for_selector('div[role="main"]', timeout=15000)
+            await page.wait_for_selector('div[role="main"]', timeout=20000)
+            logger.info("✅ Search results loaded")
         except PlaywrightTimeoutError:
-            logger.error(f"Search results not found for {query}")
+            logger.error("❌ Search results not found - page may be blocked")
             return results
         
         # Scroll to load more results
-        async def scroll_results():
-            try:
-                last_height = await page.evaluate('document.querySelector(\'div[role="main"]\').scrollHeight')
-                for _ in range(3):
-                    await page.evaluate('document.querySelector(\'div[role="main"]\').scrollTo(0, document.querySelector(\'div[role="main"]\').scrollHeight)')
-                    await asyncio.sleep(2)
-                    new_height = await page.evaluate('document.querySelector(\'div[role="main"]\').scrollHeight')
-                    if new_height == last_height:
-                        break
-                    last_height = new_height
-            except Exception as e:
-                logger.warning(f"Error during scrolling: {e}")
+        logger.info("📜 Scrolling to load more results...")
+        for i in range(3):
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await asyncio.sleep(2)
         
-        await scroll_results()
-        
-        # Extract business listings
+        # Find all business listings
+        await asyncio.sleep(3)
         listings = await page.query_selector_all('div[role="article"]')
-        logger.info(f"Found {len(listings)} listings for query: {query}")
+        logger.info(f"📋 Found {len(listings)} potential listings")
         
-        for i, listing in enumerate(listings[:10]):  # Limit to top 10 results
+        # Extract data from each listing
+        for i, listing in enumerate(listings[:10]):  # Limit to top 10
             try:
-                # Click on listing to load details
-                await listing.click()
-                await asyncio.sleep(2)
+                logger.info(f"📊 Processing listing {i+1}/10...")
                 
-                # Extract details with fallback
+                # Click on the listing to load details
+                await listing.click()
+                await asyncio.sleep(3)  # Wait for details to load
+                
+                # Extract business information
                 name = await page.evaluate('''() => {
-                    const el = document.querySelector('h1') || 
-                              document.querySelector('[data-attrid="title"]');
-                    return el ? el.innerText.trim() : "";
+                    const selectors = ['h1[data-attrid="title"]', 'h1', '[data-attrid="title"]'];
+                    for (let sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    return '';
                 }''') or "N/A"
                 
                 address = await page.evaluate('''() => {
-                    const el = document.querySelector('button[data-item-id*="address"]') ||
-                              document.querySelector('[data-item-id*="address"]') ||
-                              document.querySelector('div[data-tooltip*="Address"]');
-                    return el ? el.innerText.trim() : "";
-                }''') or "N/A"
-                
-                website = await page.evaluate('''() => {
-                    const el = document.querySelector('a[data-item-id*="authority"]') ||
-                              document.querySelector('a[href*="http"]:not([href*="google"])');
-                    return el ? el.getAttribute("href") : "";
+                    const selectors = [
+                        'button[data-item-id*="address"]',
+                        '[data-item-id*="address"]',
+                        '.rogA2c .Io6YTe',
+                        '[aria-label*="Address"]'
+                    ];
+                    for (let sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    return '';
                 }''') or "N/A"
                 
                 phone = await page.evaluate('''() => {
-                    const el = document.querySelector('button[data-item-id*="phone"]') ||
-                              document.querySelector('[data-item-id*="phone"]') ||
-                              document.querySelector('div[data-tooltip*="Phone"]');
-                    return el ? el.innerText.trim() : "";
+                    const selectors = [
+                        'button[data-item-id*="phone"]',
+                        '[data-item-id*="phone"]',
+                        '.rogA2c .UsdlK',
+                        '[aria-label*="Phone"]'
+                    ];
+                    for (let sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    return '';
+                }''') or "N/A"
+                
+                website = await page.evaluate('''() => {
+                    const selectors = [
+                        'a[data-item-id*="authority"]',
+                        'a[href*="http"]:not([href*="google"]):not([href*="maps"])'
+                    ];
+                    for (let sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.href && !el.href.includes('google') && !el.href.includes('maps')) {
+                            return el.href;
+                        }
+                    }
+                    return '';
                 }''') or "N/A"
                 
                 rating = await page.evaluate('''() => {
-                    const el = document.querySelector('span[aria-label*="stars"]') ||
-                              document.querySelector('div[role="img"][aria-label*="stars"]');
+                    const el = document.querySelector('span[aria-label*="stars"]');
                     if (el && el.getAttribute('aria-label')) {
-                        const match = el.getAttribute('aria-label').match(/([0-9.]+) stars/);
-                        return match ? match[1] : "";
+                        const match = el.getAttribute('aria-label').match(/([0-9.]+)/);
+                        return match ? match[1] : '';
                     }
-                    return "";
+                    return '';
                 }''') or "N/A"
                 
-                if name == "N/A":
-                    logger.warning(f"Skipping listing {i+1} - no name found")
+                # Skip if no name found
+                if name in ["N/A", ""]:
+                    logger.warning(f"⚠️ Skipping listing {i+1} - no name found")
                     continue
                 
+                # Create result object
                 result = {
                     "query": query,
                     "name": name,
                     "address": address,
-                    "website": website,
                     "phone": phone,
-                    "rating": rating
+                    "website": website,
+                    "rating": rating,
+                    "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S")
                 }
                 
                 results.append(result)
-                logger.info(f"Scraped: {name}")
+                logger.info(f"✅ Scraped: {name}")
                 
-                # Insert into Supabase with retry
-                for attempt in range(3):
-                    try:
-                        supabase.table("leads").insert(result).execute()
-                        logger.info(f"Inserted {name} into Supabase")
-                        break
-                    except Exception as e:
-                        logger.error(f"Attempt {attempt + 1} failed to insert {name} into Supabase: {e}")
-                        if attempt == 2:
-                            logger.error(f"Failed to insert {name} after 3 attempts")
-                        await asyncio.sleep(2)
+                # Save to Supabase
+                try:
+                    supabase.table("leads").insert(result).execute()
+                    logger.info(f"💾 Saved {name} to Supabase")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save {name} to Supabase: {e}")
                 
             except Exception as e:
-                logger.error(f"Error scraping listing {i+1} for query {query}: {e}")
+                logger.error(f"❌ Error processing listing {i+1}: {e}")
                 continue
     
-    except PlaywrightTimeoutError:
-        logger.error(f"Timeout error for query: {query}")
     except Exception as e:
-        logger.error(f"Error processing query {query}: {e}")
+        logger.error(f"❌ Error processing query '{query}': {e}")
     
     return results
 
 async def main():
-    """Main execution function"""
+    """Main scraper function"""
+    logger.info("🚀 Starting Google Maps Scraper...")
+    
     async with async_playwright() as p:
-        # Set up browser with proxy
+        # Browser configuration
         browser_args = {
             "headless": True,
             "args": [
-                "--no-sandbox", 
+                "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor"
             ]
         }
         
+        # Add proxy if configured
         if PROXY.get("server"):
             browser_args["proxy"] = PROXY
+            logger.info(f"🌐 Using proxy: {PROXY['server']}")
         
+        # Launch browser
         try:
             browser = await p.chromium.launch(**browser_args)
-            logger.info("Browser launched successfully")
+            logger.info("✅ Browser launched successfully")
         except Exception as e:
-            logger.error(f"Failed to launch browser: {e}")
+            logger.error(f"❌ Failed to launch browser: {e}")
             return
         
-        # Rotate user-agents
+        # Create browser context
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -287,30 +346,35 @@ async def main():
         
         context = await browser.new_context(
             user_agent=random.choice(user_agents),
-            viewport={"width": 1280, "height": 720}
+            viewport={"width": 1366, "height": 768}
         )
+        
         page = await context.new_page()
         
         # Process all queries
         total_results = 0
-        for query_dict in QUERIES:
+        for i, query_dict in enumerate(QUERIES, 1):
+            logger.info(f"📍 Processing query {i}/{len(QUERIES)}: {query_dict['query']}")
+            
             query_results = await scrape_google_maps(query_dict["query"], page)
             total_results += len(query_results)
-            logger.info(f"Completed query: {query_dict['query']} - {len(query_results)} results")
             
-            # Random delay between queries
-            delay = random.uniform(5, 10)
-            logger.info(f"Waiting {delay:.1f} seconds before next query...")
-            await asyncio.sleep(delay)
+            logger.info(f"✅ Query {i} completed: {len(query_results)} results")
+            
+            # Random delay between queries to avoid detection
+            if i < len(QUERIES):  # Don't delay after the last query
+                delay = random.uniform(10, 20)
+                logger.info(f"⏳ Waiting {delay:.1f} seconds before next query...")
+                await asyncio.sleep(delay)
         
         await browser.close()
-        logger.info(f"Scraping completed - Total results: {total_results}")
+        logger.info(f"🎉 Scraping completed! Total results: {total_results}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Scraping interrupted by user")
+        logger.info("⏹️ Scraping interrupted by user")
     except Exception as e:
-        logger.error(f"Main execution failed: {e}")
+        logger.error(f"❌ Main execution failed: {e}")
         exit(1)
