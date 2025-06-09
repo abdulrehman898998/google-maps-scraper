@@ -1,7 +1,6 @@
 services:
-  app:
-    name: maps-scraper
+  maps-scraper:
     type: worker
-    buildCommand: pip install -r requirements.txt && playwright install chromium
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && playwright install --with-deps
     startCommand: python google_maps_scraper.py
-    python: 3.9
+    pythonVersion: 3.9
