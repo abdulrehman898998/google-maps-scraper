@@ -1,4 +1,4 @@
 playwright
-   pandas
-   supabase
-   python-2captcha
+pandas
+supabase
+python-2captcha
