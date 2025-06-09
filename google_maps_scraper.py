@@ -6,6 +6,8 @@ import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from supabase import create_client, Client
 from urllib.parse import quote
+from twocaptcha import TwoCaptcha
+from twocaptcha.api import ApiException
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,14 +34,8 @@ except Exception as e:
 # Initialize 2Captcha client
 twocaptcha = None
 try:
-    from twocaptcha import TwoCaptcha
-    from twocaptcha.api import ApiException
     twocaptcha = TwoCaptcha(TWOCAPTCHA_API_KEY)
     logger.info("✅ 2Captcha client initialized successfully")
-except ImportError as e:
-    logger.error(f"❌ Failed to import 2captcha: {e}")
-    logger.error("Make sure 2captcha-python is installed: pip install 2captcha-python")
-    exit(1)
 except Exception as e:
     logger.error(f"❌ Failed to initialize 2Captcha: {e}")
     exit(1)
@@ -64,11 +60,8 @@ async def solve_captcha(page):
     """Attempt to solve CAPTCHA using 2Captcha service"""
     try:
         logger.info("🔍 Checking for CAPTCHA...")
-        
-        # Wait a bit for any CAPTCHA to load
         await asyncio.sleep(3)
         
-        # Look for different types of CAPTCHA elements
         captcha_selectors = [
             'iframe[src*="recaptcha"]',
             'div[class*="recaptcha"]',
@@ -87,23 +80,18 @@ async def solve_captcha(page):
             logger.info("✅ No CAPTCHA detected")
             return True
         
-        # Get the site key for reCAPTCHA
         sitekey = await page.evaluate('''() => {
-            // Try multiple ways to find the sitekey
             const iframe = document.querySelector('iframe[src*="recaptcha"]');
             if (iframe && iframe.src) {
                 const match = iframe.src.match(/k=([A-Za-z0-9_-]+)/);
                 if (match) return match[1];
             }
-            
-            // Look for data-sitekey attribute
             const elements = document.querySelectorAll('[data-sitekey]');
             for (let el of elements) {
                 if (el.getAttribute('data-sitekey')) {
                     return el.getAttribute('data-sitekey');
                 }
             }
-            
             return null;
         }''')
         
@@ -113,49 +101,30 @@ async def solve_captcha(page):
         
         logger.info(f"🔑 Found sitekey: {sitekey[:20]}...")
         
-        # Solve CAPTCHA with 2Captcha
         logger.info("🤖 Solving CAPTCHA with 2Captcha...")
         result = twocaptcha.recaptcha(
             sitekey=sitekey,
-            url=page.url
+            url=page.url,
+            proxy=PROXY if PROXY.get("server") else None
         )
         
         captcha_solution = result['code']
         logger.info("✅ CAPTCHA solved successfully!")
         
-        # Inject the solution
         await page.evaluate(f'''
             (function() {{
-                // Find and fill the response textarea
                 const responseArea = document.getElementById('g-recaptcha-response') || 
                                    document.querySelector('[name="g-recaptcha-response"]');
                 if (responseArea) {{
                     responseArea.style.display = 'block';
                     responseArea.value = "{captcha_solution}";
-                    responseArea.innerHTML = "{captcha_solution}";
                 }}
-                
-                // Trigger the callback if available
-                if (typeof grecaptcha !== 'undefined' && grecaptcha.getResponse) {{
-                    try {{
-                        grecaptcha.execute();
-                    }} catch(e) {{
-                        console.log('grecaptcha.execute failed:', e);
-                    }}
-                }}
-                
-                // Submit any forms that might be waiting
-                const forms = document.querySelectorAll('form');
-                forms.forEach(form => {{
-                    const submitBtn = form.querySelector('[type="submit"]');
-                    if (submitBtn) {{
-                        submitBtn.click();
-                    }}
-                }});
+                const submitBtn = document.querySelector('[type="submit"]');
+                if (submitBtn) submitBtn.click();
             }})();
         ''')
         
-        await asyncio.sleep(3)  # Wait for submission
+        await asyncio.sleep(3)
         return True
         
     except ApiException as e:
@@ -171,18 +140,14 @@ async def scrape_google_maps(query, page):
     
     try:
         logger.info(f"🔍 Processing query: {query}")
-        
-        # Navigate to Google Maps search
         encoded_query = quote(query)
         url = f"https://www.google.com/maps/search/{encoded_query}/"
         
         logger.info(f"🌐 Navigating to: {url}")
         await page.goto(url, wait_until="networkidle", timeout=30000)
         
-        # Check for CAPTCHA
         await solve_captcha(page)
         
-        # Wait for search results to load
         try:
             await page.wait_for_selector('div[role="main"]', timeout=20000)
             logger.info("✅ Search results loaded")
@@ -190,27 +155,21 @@ async def scrape_google_maps(query, page):
             logger.error("❌ Search results not found - page may be blocked")
             return results
         
-        # Scroll to load more results
         logger.info("📜 Scrolling to load more results...")
         for i in range(3):
             await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
             await asyncio.sleep(2)
         
-        # Find all business listings
         await asyncio.sleep(3)
         listings = await page.query_selector_all('div[role="article"]')
         logger.info(f"📋 Found {len(listings)} potential listings")
         
-        # Extract data from each listing
-        for i, listing in enumerate(listings[:10]):  # Limit to top 10
+        for i, listing in enumerate(listings[:10]):
             try:
                 logger.info(f"📊 Processing listing {i+1}/10...")
-                
-                # Click on the listing to load details
                 await listing.click()
-                await asyncio.sleep(3)  # Wait for details to load
+                await asyncio.sleep(3)
                 
-                # Extract business information
                 name = await page.evaluate('''() => {
                     const selectors = ['h1[data-attrid="title"]', 'h1', '[data-attrid="title"]'];
                     for (let sel of selectors) {
@@ -271,12 +230,10 @@ async def scrape_google_maps(query, page):
                     return '';
                 }''') or "N/A"
                 
-                # Skip if no name found
                 if name in ["N/A", ""]:
                     logger.warning(f"⚠️ Skipping listing {i+1} - no name found")
                     continue
                 
-                # Create result object
                 result = {
                     "query": query,
                     "name": name,
@@ -290,7 +247,6 @@ async def scrape_google_maps(query, page):
                 results.append(result)
                 logger.info(f"✅ Scraped: {name}")
                 
-                # Save to Supabase
                 try:
                     supabase.table("leads").insert(result).execute()
                     logger.info(f"💾 Saved {name} to Supabase")
@@ -311,7 +267,6 @@ async def main():
     logger.info("🚀 Starting Google Maps Scraper...")
     
     async with async_playwright() as p:
-        # Browser configuration
         browser_args = {
             "headless": True,
             "args": [
@@ -324,12 +279,10 @@ async def main():
             ]
         }
         
-        # Add proxy if configured
         if PROXY.get("server"):
             browser_args["proxy"] = PROXY
             logger.info(f"🌐 Using proxy: {PROXY['server']}")
         
-        # Launch browser
         try:
             browser = await p.chromium.launch(**browser_args)
             logger.info("✅ Browser launched successfully")
@@ -337,7 +290,6 @@ async def main():
             logger.error(f"❌ Failed to launch browser: {e}")
             return
         
-        # Create browser context
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -351,7 +303,6 @@ async def main():
         
         page = await context.new_page()
         
-        # Process all queries
         total_results = 0
         for i, query_dict in enumerate(QUERIES, 1):
             logger.info(f"📍 Processing query {i}/{len(QUERIES)}: {query_dict['query']}")
@@ -361,8 +312,7 @@ async def main():
             
             logger.info(f"✅ Query {i} completed: {len(query_results)} results")
             
-            # Random delay between queries to avoid detection
-            if i < len(QUERIES):  # Don't delay after the last query
+            if i < len(QUERIES):
                 delay = random.uniform(10, 20)
                 logger.info(f"⏳ Waiting {delay:.1f} seconds before next query...")
                 await asyncio.sleep(delay)
