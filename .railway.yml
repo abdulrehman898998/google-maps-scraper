@@ -1,0 +1,5 @@
+services:
+     - name: maps-scraper
+       type: worker
+       buildCommand: pip install -r requirements.txt && playwright install
+       startCommand: python google_maps_scraper.py
